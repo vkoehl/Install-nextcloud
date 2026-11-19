@@ -236,6 +236,7 @@ opcache.revalidate_freq = 1
 apc.enable_cli = 1
 EOF
 
+
 # ------------------------------------------
 # 6. Téléchargement Nextcloud
 # ------------------------------------------
@@ -244,29 +245,54 @@ echo "[6/10] Téléchargement Nextcloud ${NC_VERSION}..."
 
 cd /tmp
 
-ARCHIVE="nextcloud.zip"
-URL="https://download.nextcloud.com/server/releases/latest-${NC_VERSION}.zip"
+ARCHIVE="latest-${NC_VERSION}.zip"
+CHECKSUM="${ARCHIVE}.sha256"
 
-curl -fL "$URL" -o "$ARCHIVE"
-curl -fsSL "${URL}.sha256" -o "${ARCHIVE}.sha256"
+URL="https://download.nextcloud.com/server/releases/${ARCHIVE}"
 
-EXPECTED_HASH=$(awk '{print $1}' "${ARCHIVE}.sha256")
-ACTUAL_HASH=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+# Nettoyage des anciens téléchargements
+rm -f "$ARCHIVE" "$CHECKSUM"
 
-if [[ -z "$EXPECTED_HASH" || "$EXPECTED_HASH" != "$ACTUAL_HASH" ]]; then
-    echo "ERREUR : contrôle SHA256 échoué."
+# Téléchargement de Nextcloud
+echo "Téléchargement de l'archive..."
+curl -fL --retry 3 --retry-delay 5 "$URL" -o "$ARCHIVE"
+
+# Téléchargement du checksum
+echo "Téléchargement du SHA256..."
+curl -fL --retry 3 --retry-delay 5 "${URL}.sha256" -o "$CHECKSUM"
+
+# Vérification de l'existence des fichiers
+if [[ ! -s "$ARCHIVE" || ! -s "$CHECKSUM" ]]; then
+    echo "ERREUR : archive ou checksum manquant."
     exit 1
 fi
 
-echo "Contrôle SHA256 OK."
+# Vérification de l'intégrité
+echo "Vérification SHA256..."
+
+if sha256sum --check --ignore-missing "$CHECKSUM"; then
+    echo "SHA256 : vérification réussie !"
+else
+    echo "ERREUR : SHA256 invalide."
+    echo "L'installation est interrompue."
+    rm -f "$ARCHIVE" "$CHECKSUM"
+    exit 1
+fi
+
+# Extraction
+echo "Extraction de Nextcloud..."
 
 unzip -q "$ARCHIVE" -d /var/www/
 
+# Préparation des dossiers
 mkdir -p "$DATA_DIR"
 
 chown -R www-data:www-data "$NC_DIR"
 chown -R www-data:www-data "$DATA_DIR"
+
 chmod 750 "$DATA_DIR"
+
+echo "Nextcloud téléchargé et extrait avec succès."
 
 # ------------------------------------------
 # 7. Installation Nextcloud
