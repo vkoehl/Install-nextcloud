@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # Reverse Proxy Nginx externe
 # ==========================================
 
-NC_VERSION="34"
+NC_VERSION="34.0.6"
 NC_DIR="/var/www/nextcloud"
 DATA_DIR="/var/ncdata"
 DB_NAME="nextcloud"
