@@ -110,25 +110,65 @@ systemctl enable --now mariadb
 systemctl enable --now redis-server
 systemctl enable --now cron
 
+
 # ------------------------------------------
 # 3. Configuration MariaDB
 # ------------------------------------------
 
 echo "[3/10] Configuration MariaDB..."
 
-mariadb <<SQL
-CREATE DATABASE ${DB_NAME}
-CHARACTER SET utf8mb4
-COLLATE utf8mb4_general_ci;
+# Génération d'un mot de passe uniquement si nécessaire
+DB_PASS=$(openssl rand -hex 32)
 
-CREATE USER '${DB_USER}'@'localhost'
-IDENTIFIED BY '${DB_PASS}';
+# Vérification de l'existence de la base
+DB_EXISTS=$(mariadb -Nse \
+    "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME}';")
 
-GRANT ALL PRIVILEGES ON ${DB_NAME}.*
-TO '${DB_USER}'@'localhost';
+if [[ "$DB_EXISTS" -eq 0 ]]; then
+    echo "Création de la base ${DB_NAME}..."
+    mariadb -e "
+        CREATE DATABASE \`${DB_NAME}\`
+        CHARACTER SET utf8mb4
+        COLLATE utf8mb4_general_ci;
+    "
+else
+    echo "La base ${DB_NAME} existe déjà : conservation."
+fi
 
-FLUSH PRIVILEGES;
-SQL
+# Vérification de l'existence de l'utilisateur
+USER_EXISTS=$(mariadb -Nse \
+    "SELECT COUNT(*) FROM mysql.user WHERE User='${DB_USER}' AND Host='localhost';")
+
+if [[ "$USER_EXISTS" -eq 0 ]]; then
+    echo "Création de l'utilisateur ${DB_USER}..."
+    mariadb -e "
+        CREATE USER '${DB_USER}'@'localhost'
+        IDENTIFIED BY '${DB_PASS}';
+    "
+else
+    echo "L'utilisateur ${DB_USER} existe déjà : conservation."
+
+    # Récupération du mot de passe depuis la configuration Nextcloud
+    if [[ -f "${NC_DIR}/config/config.php" ]]; then
+        DB_PASS=$(php -r '
+            include $argv[1];
+            echo $CONFIG["dbpassword"];
+        ' "${NC_DIR}/config/config.php")
+    else
+        echo "ERREUR : impossible de récupérer le mot de passe MariaDB."
+        exit 1
+    fi
+fi
+
+# Attribution des droits
+mariadb -e "
+    GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.*
+    TO '${DB_USER}'@'localhost';
+
+    FLUSH PRIVILEGES;
+"
+
+echo "Configuration MariaDB terminée."
 
 # ------------------------------------------
 # 4. Configuration Apache
