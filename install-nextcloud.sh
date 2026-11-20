@@ -2,122 +2,145 @@
 set -Eeuo pipefail
 
 # ==========================================================
-# NEXTCLOUD 35 - DEBIAN 13 TRIXIE
-# Installation directe, sans reverse proxy
-#
-# Apache : 80 / 443
-# PHP    : version Debian
-# MariaDB
-# Redis
-# APCu
-# HTTPS  : Let's Encrypt / Certbot
-# Data  : /var/ncdata
+# NEXTCLOUD 35 - DEBIAN 13
+# Apache + PHP + MariaDB + Redis
+# HTTP uniquement (sans SSL, sans Certbot, sans reverse proxy)
+# Stockage local : /var/ncdata
 # ==========================================================
 
-NC_MAJOR="35"
+NC_VERSION="35.0.3"
+NC_URL="https://download.nextcloud.com/server/releases/nextcloud-${NC_VERSION}.zip"
+NC_CHECKSUM_URL="${NC_URL}.sha256"
+
 NC_DIR="/var/www/nextcloud"
-DATA_DIR="/var/ncdata"
-DB_NAME="nextcloud"
-DB_USER="ncuser"
+NC_DATA="/var/ncdata"
+NC_DB="nextcloud"
+NC_DB_USER="ncuser"
 
-CREDENTIALS="/root/nextcloud-credentials.txt"
-LOG_FILE="/var/log/nextcloud-install.log"
+APACHE_CONF="/etc/apache2/sites-available/nextcloud.conf"
+CRON_FILE="/etc/cron.d/nextcloud"
 
-exec > >(tee -a "$LOG_FILE") 2>&1
+TEMP_DIR="$(mktemp -d)"
 
-echo
-echo "=========================================================="
-echo " INSTALLATION NEXTCLOUD ${NC_MAJOR} - DEBIAN 13"
-echo "=========================================================="
-date
+cleanup() {
+    rm -rf "$TEMP_DIR"
+}
+trap cleanup EXIT
 
 # ----------------------------------------------------------
-# VERIFICATIONS
+# Vérifications
 # ----------------------------------------------------------
 
 if [[ "$EUID" -ne 0 ]]; then
-    echo "ERREUR : exécuter le script en root."
+    echo "Erreur : lance ce script en root."
     exit 1
 fi
 
 if ! grep -q 'VERSION_ID="13"' /etc/os-release; then
-    echo "ERREUR : Debian 13 est requis."
+    echo "Erreur : ce script est prévu pour Debian 13."
     exit 1
 fi
 
-if [[ -e "$NC_DIR" ]]; then
-    echo "ERREUR : $NC_DIR existe déjà."
-    echo "Installation interrompue pour éviter tout écrasement."
+if [[ -d "$NC_DIR" ]]; then
+    echo "Erreur : $NC_DIR existe déjà."
+    echo "Le script refuse d'écraser une installation existante."
     exit 1
 fi
 
-# ----------------------------------------------------------
-# CONFIGURATION UTILISATEUR
-# ----------------------------------------------------------
-
-read -rp "Nom de domaine (ex: cloud.mondomaine.fr) : " DOMAIN
-read -rp "Email Let's Encrypt : " EMAIL
-read -rp "Utilisateur administrateur Nextcloud : " ADMIN_USER
-read -rsp "Mot de passe administrateur Nextcloud : " ADMIN_PASS
-echo
-
-if [[ -z "$DOMAIN" || -z "$EMAIL" || -z "$ADMIN_USER" || -z "$ADMIN_PASS" ]]; then
-    echo "ERREUR : tous les champs sont obligatoires."
-    exit 1
-fi
-
-if [[ "$DOMAIN" == *"/"* || "$DOMAIN" == *" "* ]]; then
-    echo "ERREUR : domaine invalide."
+if [[ -d "$NC_DATA" ]]; then
+    echo "Erreur : $NC_DATA existe déjà."
+    echo "Vérifie son contenu avant de poursuivre."
     exit 1
 fi
 
 # ----------------------------------------------------------
-# MISE A JOUR DEBIAN
+# Paramètres utilisateur
 # ----------------------------------------------------------
 
 echo
-echo "[1/11] Mise à jour Debian..."
+echo "===== Installation Nextcloud ${NC_VERSION} ====="
+echo
 
-apt-get update
-apt-get upgrade -y
+read -rp "Nom de domaine ou IP du serveur (ex: cloud.mondomaine.fr) : " NC_HOST
+read -rp "Nom du compte administrateur Nextcloud : " NC_ADMIN
+
+read -rsp "Mot de passe administrateur Nextcloud : " NC_ADMIN_PASS
+echo
+
+read -rsp "Confirme le mot de passe administrateur : " NC_ADMIN_PASS_CONFIRM
+echo
+
+if [[ "$NC_ADMIN_PASS" != "$NC_ADMIN_PASS_CONFIRM" ]]; then
+    echo "Erreur : les mots de passe ne correspondent pas."
+    exit 1
+fi
+
+if [[ -z "$NC_HOST" || -z "$NC_ADMIN" || -z "$NC_ADMIN_PASS" ]]; then
+    echo "Erreur : un champ obligatoire est vide."
+    exit 1
+fi
 
 # ----------------------------------------------------------
-# INSTALLATION PAQUETS
+# Base de données
+# ----------------------------------------------------------
+
+if mariadb -NBe "SHOW DATABASES LIKE '${NC_DB}';" 2>/dev/null | grep -q "${NC_DB}"; then
+    echo "Erreur : la base ${NC_DB} existe déjà."
+    exit 1
+fi
+
+if mariadb -NBe "SELECT User FROM mysql.user WHERE User='${NC_DB_USER}';" 2>/dev/null | grep -q "${NC_DB_USER}"; then
+    echo "Erreur : l'utilisateur SQL ${NC_DB_USER} existe déjà."
+    exit 1
+fi
+
+DB_PASS="$(openssl rand -base64 36 | tr -d '\n')"
+
+# ----------------------------------------------------------
+# Mise à jour Debian
 # ----------------------------------------------------------
 
 echo
-echo "[2/11] Installation des paquets..."
+echo "===== Mise à jour du système ====="
 
-apt-get install -y \
+apt update
+apt full-upgrade -y
+
+# ----------------------------------------------------------
+# Installation des paquets
+# ----------------------------------------------------------
+
+echo
+echo "===== Installation des dépendances ====="
+
+apt install -y \
     apache2 \
     mariadb-server \
     redis-server \
-    cron \
     unzip \
     curl \
     wget \
-    openssl \
-    ca-certificates \
-    certbot \
-    python3-certbot-apache \
+    rsync \
+    sudo \
+    cron \
     libapache2-mod-php \
     php \
     php-cli \
     php-common \
-    php-gd \
     php-mysql \
+    php-gd \
     php-curl \
-    php-zip \
-    php-xml \
     php-mbstring \
+    php-xml \
+    php-zip \
     php-intl \
     php-bcmath \
     php-gmp \
     php-imagick \
     php-apcu \
     php-redis \
-    php-bz2 \
-    php-ldap
+    php-ldap \
+    php-bz2
 
 systemctl enable --now apache2
 systemctl enable --now mariadb
@@ -125,80 +148,19 @@ systemctl enable --now redis-server
 systemctl enable --now cron
 
 # ----------------------------------------------------------
-# DETECTION PHP
+# Configuration PHP
 # ----------------------------------------------------------
 
-PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+echo
+echo "===== Configuration PHP ====="
+
+PHP_VERSION="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
 PHP_INI="/etc/php/${PHP_VERSION}/apache2/php.ini"
 
-echo "PHP détecté : ${PHP_VERSION}"
-
 if [[ ! -f "$PHP_INI" ]]; then
-    echo "ERREUR : php.ini introuvable."
+    echo "Erreur : php.ini introuvable : $PHP_INI"
     exit 1
 fi
-
-# ----------------------------------------------------------
-# CONFIGURATION MARIADB
-# ----------------------------------------------------------
-
-echo
-echo "[3/11] Configuration MariaDB..."
-
-DB_PASS=""
-
-DB_EXISTS=$(mariadb -Nse \
-    "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME}';")
-
-USER_EXISTS=$(mariadb -Nse \
-    "SELECT COUNT(*) FROM mysql.user WHERE User='${DB_USER}' AND Host='localhost';")
-
-if [[ "$DB_EXISTS" -eq 0 ]]; then
-    echo "Création de la base ${DB_NAME}..."
-
-    mariadb -e "
-        CREATE DATABASE \`${DB_NAME}\`
-        CHARACTER SET utf8mb4
-        COLLATE utf8mb4_general_ci;
-    "
-else
-    echo "Base ${DB_NAME} déjà présente : conservée."
-fi
-
-if [[ "$USER_EXISTS" -eq 0 ]]; then
-    DB_PASS=$(openssl rand -hex 32)
-
-    echo "Création utilisateur MariaDB ${DB_USER}..."
-
-    mariadb -e "
-        CREATE USER '${DB_USER}'@'localhost'
-        IDENTIFIED BY '${DB_PASS}';
-    "
-else
-    echo "Utilisateur MariaDB ${DB_USER} déjà présent."
-
-    read -rsp "Mot de passe MariaDB existant pour ${DB_USER} : " DB_PASS
-    echo
-
-    if [[ -z "$DB_PASS" ]]; then
-        echo "ERREUR : mot de passe vide."
-        exit 1
-    fi
-fi
-
-mariadb -e "
-    GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.*
-    TO '${DB_USER}'@'localhost';
-
-    FLUSH PRIVILEGES;
-"
-
-# ----------------------------------------------------------
-# CONFIGURATION PHP
-# ----------------------------------------------------------
-
-echo
-echo "[4/11] Configuration PHP..."
 
 sed -i 's/^memory_limit = .*/memory_limit = 512M/' "$PHP_INI"
 sed -i 's/^upload_max_filesize = .*/upload_max_filesize = 10G/' "$PHP_INI"
@@ -206,38 +168,55 @@ sed -i 's/^post_max_size = .*/post_max_size = 10G/' "$PHP_INI"
 sed -i 's/^max_execution_time = .*/max_execution_time = 3600/' "$PHP_INI"
 sed -i 's/^max_input_time = .*/max_input_time = 3600/' "$PHP_INI"
 
-cat >> "$PHP_INI" <<'EOF'
+sed -i 's/^;date.timezone =.*/date.timezone = Europe\/Paris/' "$PHP_INI"
 
-; Nextcloud
-date.timezone = Europe/Paris
-output_buffering = 0
+cat >> "$PHP_INI" <<EOF
 
-; OPcache
+; Nextcloud optimisations
 opcache.enable=1
 opcache.enable_cli=1
 opcache.memory_consumption=128
 opcache.interned_strings_buffer=16
 opcache.max_accelerated_files=10000
-opcache.save_comments=1
 opcache.revalidate_freq=1
-
-; APCu
 apc.enable_cli=1
 EOF
 
 # ----------------------------------------------------------
-# CONFIGURATION APACHE
+# Configuration MariaDB
 # ----------------------------------------------------------
 
 echo
-echo "[5/11] Configuration Apache..."
+echo "===== Configuration MariaDB ====="
 
-a2enmod rewrite headers env dir mime setenvif ssl
+mysql -u root <<SQL
+CREATE DATABASE ${NC_DB}
+CHARACTER SET utf8mb4
+COLLATE utf8mb4_general_ci;
 
-cat > /etc/apache2/sites-available/nextcloud.conf <<EOF
+CREATE USER '${NC_DB_USER}'@'localhost'
+IDENTIFIED BY '${DB_PASS}';
+
+GRANT ALL PRIVILEGES ON ${NC_DB}.*
+TO '${NC_DB_USER}'@'localhost';
+
+FLUSH PRIVILEGES;
+SQL
+
+# ----------------------------------------------------------
+# Configuration Apache
+# ----------------------------------------------------------
+
+echo
+echo "===== Configuration Apache ====="
+
+a2enmod rewrite headers env dir mime setenvif
+
+a2dissite 000-default.conf || true
+
+cat > "$APACHE_CONF" <<EOF
 <VirtualHost *:80>
-
-    ServerName ${DOMAIN}
+    ServerName ${NC_HOST}
     DocumentRoot ${NC_DIR}
 
     <Directory ${NC_DIR}>
@@ -246,196 +225,163 @@ cat > /etc/apache2/sites-available/nextcloud.conf <<EOF
         Options FollowSymLinks MultiViews
     </Directory>
 
+    ErrorLog \${APACHE_LOG_DIR}/nextcloud_error.log
+    CustomLog \${APACHE_LOG_DIR}/nextcloud_access.log combined
+
     RewriteEngine On
 
     RewriteRule ^/\\.well-known/carddav$ /remote.php/dav/ [R=301,L]
     RewriteRule ^/\\.well-known/caldav$ /remote.php/dav/ [R=301,L]
-
-    ErrorLog \${APACHE_LOG_DIR}/nextcloud_error.log
-    CustomLog \${APACHE_LOG_DIR}/nextcloud_access.log combined
-
 </VirtualHost>
 EOF
 
-a2dissite 000-default.conf || true
 a2ensite nextcloud.conf
 
 # ----------------------------------------------------------
-# TELECHARGEMENT NEXTCLOUD
+# Téléchargement Nextcloud
 # ----------------------------------------------------------
 
 echo
-echo "[6/11] Téléchargement Nextcloud ${NC_MAJOR}..."
+echo "===== Téléchargement Nextcloud ${NC_VERSION} ====="
 
-cd /tmp
+cd "$TEMP_DIR"
 
-ARCHIVE="latest-${NC_MAJOR}.zip"
-CHECKSUM="${ARCHIVE}.sha256"
+wget -q --show-progress "$NC_URL" -O nextcloud.zip
+wget -q "$NC_CHECKSUM_URL" -O nextcloud.zip.sha256
 
-URL="https://download.nextcloud.com/server/releases/${ARCHIVE}"
-
-rm -f "$ARCHIVE" "$CHECKSUM"
-
-curl -fL --retry 3 --retry-delay 5 "$URL" -o "$ARCHIVE"
-curl -fL --retry 3 --retry-delay 5 "${URL}.sha256" -o "$CHECKSUM"
-
-if [[ ! -s "$ARCHIVE" || ! -s "$CHECKSUM" ]]; then
-    echo "ERREUR : téléchargement incomplet."
-    exit 1
-fi
-
-# Récupération du hash et normalisation du format
-EXPECTED_HASH=$(awk 'NR==1 {print $1}' "$CHECKSUM")
+EXPECTED_HASH="$(awk 'NR==1 {print $1}' nextcloud.zip.sha256)"
 
 if [[ ! "$EXPECTED_HASH" =~ ^[a-fA-F0-9]{64}$ ]]; then
-    echo "ERREUR : format SHA256 invalide."
-    cat "$CHECKSUM"
+    echo "Erreur : checksum SHA256 invalide ou format inattendu."
+    cat nextcloud.zip.sha256
     exit 1
 fi
 
-printf "%s  %s\n" "$EXPECTED_HASH" "$ARCHIVE" > /tmp/nextcloud-checksum.tmp
+printf "%s  nextcloud.zip\n" "$EXPECTED_HASH" > nextcloud-check.sha256
 
-if ! sha256sum -c /tmp/nextcloud-checksum.tmp; then
-    echo "ERREUR : SHA256 incorrect."
-    exit 1
-fi
+echo "===== Vérification SHA256 ====="
 
-echo "Checksum validé."
+sha256sum -c nextcloud-check.sha256
 
 # ----------------------------------------------------------
-# EXTRACTION
+# Extraction
 # ----------------------------------------------------------
 
 echo
-echo "[7/11] Extraction Nextcloud..."
+echo "===== Extraction Nextcloud ====="
 
-unzip -q "$ARCHIVE" -d /var/www/
+unzip -q nextcloud.zip -d /var/www/
 
-mkdir -p "$DATA_DIR"
+mkdir -p "$NC_DATA"
 
 chown -R www-data:www-data "$NC_DIR"
-chown -R www-data:www-data "$DATA_DIR"
+chown -R www-data:www-data "$NC_DATA"
 
-chmod 750 "$DATA_DIR"
+chmod 750 "$NC_DATA"
 
 # ----------------------------------------------------------
-# INSTALLATION NEXTCLOUD
+# Installation Nextcloud
 # ----------------------------------------------------------
 
 echo
-echo "[8/11] Installation Nextcloud..."
+echo "===== Installation Nextcloud ====="
 
-systemctl restart apache2
-
-runuser -u www-data -- php "${NC_DIR}/occ" maintenance:install \
+sudo -u www-data php "$NC_DIR/occ" maintenance:install \
     --database mysql \
-    --database-name "${DB_NAME}" \
-    --database-user "${DB_USER}" \
-    --database-pass "${DB_PASS}" \
-    --admin-user "${ADMIN_USER}" \
-    --admin-pass "${ADMIN_PASS}" \
-    --data-dir "${DATA_DIR}"
+    --database-name "$NC_DB" \
+    --database-user "$NC_DB_USER" \
+    --database-pass "$DB_PASS" \
+    --database-host localhost \
+    --admin-user "$NC_ADMIN" \
+    --admin-pass "$NC_ADMIN_PASS" \
+    --data-dir "$NC_DATA"
 
 # ----------------------------------------------------------
-# CONFIGURATION NEXTCLOUD
+# Configuration Nextcloud
 # ----------------------------------------------------------
 
 echo
-echo "[9/11] Configuration Nextcloud..."
+echo "===== Configuration Nextcloud ====="
 
-OCC="runuser -u www-data -- php ${NC_DIR}/occ"
+OCC="sudo -u www-data php ${NC_DIR}/occ"
 
-$OCC config:system:set trusted_domains 0 \
-    --value="${DOMAIN}"
+$OCC config:system:set trusted_domains 0 --value="localhost"
+$OCC config:system:set trusted_domains 1 --value="$NC_HOST"
 
-$OCC config:system:set overwrite.cli.url \
-    --value="https://${DOMAIN}"
+$OCC config:system:set default_phone_region --value="FR"
+$OCC config:system:set memcache.local --value="\OC\Memcache\APCu"
+$OCC config:system:set memcache.distributed --value="\OC\Memcache\Redis"
+$OCC config:system:set memcache.locking --value="\OC\Memcache\Redis"
 
-$OCC config:system:set default_phone_region \
-    --value="FR"
+$OCC config:system:set redis host --value="localhost"
+$OCC config:system:set redis port --type=integer --value=6379
 
-# Cache local APCu
-$OCC config:system:set memcache.local \
-    --value='\OC\Memcache\APCu'
-
-# Redis locking
-$OCC config:system:set memcache.locking \
-    --value='\OC\Memcache\Redis'
-
-$OCC config:system:set redis host \
-    --value="127.0.0.1"
-
-$OCC config:system:set redis port \
-    --type=integer --value=6379
-
-# Cron
 $OCC background:cron
 
-cat > /etc/cron.d/nextcloud <<EOF
+# ----------------------------------------------------------
+# Configuration Cron
+# ----------------------------------------------------------
+
+echo
+echo "===== Configuration Cron Nextcloud ====="
+
+cat > "$CRON_FILE" <<EOF
 */5 * * * * www-data php -f ${NC_DIR}/cron.php
 EOF
 
-chmod 644 /etc/cron.d/nextcloud
+chmod 644 "$CRON_FILE"
+
+# ----------------------------------------------------------
+# Finalisation
+# ----------------------------------------------------------
+
+echo
+echo "===== Finalisation ====="
 
 $OCC maintenance:update:htaccess
-
-# ----------------------------------------------------------
-# HTTPS CERTIFICAT
-# ----------------------------------------------------------
-
-echo
-echo "[10/11] Installation certificat Let's Encrypt..."
-
-systemctl reload apache2
-
-certbot --apache \
-    --non-interactive \
-    --agree-tos \
-    --email "${EMAIL}" \
-    --redirect \
-    -d "${DOMAIN}"
-
-# Configuration HTTPS Nextcloud
-$OCC config:system:set overwriteprotocol \
-    --value="https"
-
-# ----------------------------------------------------------
-# FINALISATION
-# ----------------------------------------------------------
-
-echo
-echo "[11/11] Finalisation..."
-
-cat > "$CREDENTIALS" <<EOF
-NEXTCLOUD_URL=https://${DOMAIN}
-NEXTCLOUD_ADMIN=${ADMIN_USER}
-MARIADB_DATABASE=${DB_NAME}
-MARIADB_USER=${DB_USER}
-MARIADB_PASSWORD=${DB_PASS}
-DATA_DIRECTORY=${DATA_DIR}
-EOF
-
-chmod 600 "$CREDENTIALS"
 
 systemctl restart mariadb
 systemctl restart redis-server
 systemctl restart apache2
 
-rm -f "/tmp/${ARCHIVE}" "/tmp/${CHECKSUM}" "/tmp/nextcloud-checksum.tmp"
+# Sauvegarde des identifiants
+cat > /root/nextcloud-credentials.txt <<EOF
+Nextcloud
+=========
+Adresse : http://${NC_HOST}
+Administrateur : ${NC_ADMIN}
+Mot de passe : ${NC_ADMIN_PASS}
+
+Base de données
+==============
+Nom : ${NC_DB}
+Utilisateur : ${NC_DB_USER}
+Mot de passe : ${DB_PASS}
+EOF
+
+chmod 600 /root/nextcloud-credentials.txt
+
+rm -f "$TEMP_DIR/nextcloud.zip"
+rm -f "$TEMP_DIR/nextcloud.zip.sha256"
+
+# ----------------------------------------------------------
+# Résultat
+# ----------------------------------------------------------
 
 echo
 echo "=========================================================="
-echo " INSTALLATION TERMINEE"
+echo " INSTALLATION NEXTCLOUD TERMINEE"
 echo "=========================================================="
 echo
-echo "Nextcloud : https://${DOMAIN}"
-echo "Apache   : ports 80 / 443"
-echo "PHP      : ${PHP_VERSION}"
-echo "Data     : ${DATA_DIR}"
+echo "URL : http://${NC_HOST}"
+echo "Stockage : ${NC_DATA}"
+echo "Base de données : MariaDB"
+echo "Cache : Redis"
+echo "PHP : ${PHP_VERSION}"
 echo
 echo "Identifiants enregistrés dans :"
-echo "${CREDENTIALS}"
+echo "/root/nextcloud-credentials.txt"
 echo
-runuser -u www-data -- php "${NC_DIR}/occ" status
-echo
+echo "IMPORTANT : installation HTTP uniquement."
+echo "Aucun HTTPS, Certbot ou Let's Encrypt n'a été installé."
 echo "=========================================================="
